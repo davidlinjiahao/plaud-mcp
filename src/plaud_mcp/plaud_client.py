@@ -4,6 +4,9 @@ Connects to the running Plaud Desktop app's Node.js inspector and executes
 API calls through the app's own authenticated $fetch function. This bypasses
 all token/session issues since we piggyback on the app's live session.
 
+Security note: SIGUSR1 opens the Node.js inspector on localhost:9229 for the
+lifetime of the Plaud Desktop process. Only local processes can connect.
+
 Requirements:
 - Plaud Desktop must be running and logged in
 - SIGUSR1 is sent to enable the Node.js inspector on port 9229
@@ -30,16 +33,21 @@ INSPECTOR_HOST = "127.0.0.1"
 
 
 class PlaudAPIError(Exception):
-    """Custom exception for Plaud API errors."""
-
     def __init__(self, status_code: int, message: str):
         self.status_code = status_code
         self.message = message
         super().__init__(f"Plaud API Error ({status_code}): {message}")
 
 
+def _get_inspector_targets() -> list[dict[str, Any]]:
+    """Fetch inspector targets from the debugging endpoint."""
+    data = urllib.request.urlopen(
+        f"http://{INSPECTOR_HOST}:{INSPECTOR_PORT}/json", timeout=2
+    ).read()
+    return json.loads(data)
+
+
 def _find_plaud_pid() -> int | None:
-    """Find the main Plaud Desktop process PID."""
     try:
         result = subprocess.run(
             ["pgrep", "-f", "Plaud.app/Contents/MacOS/Plaud"],
@@ -56,16 +64,11 @@ def _find_plaud_pid() -> int | None:
 
 
 def _enable_inspector(pid: int) -> bool:
-    """Send SIGUSR1 to enable Node.js inspector on the Plaud process."""
     try:
         os.kill(pid, signal.SIGUSR1)
         time.sleep(0.5)
-        # Verify inspector is listening
         try:
-            data = urllib.request.urlopen(
-                f"http://{INSPECTOR_HOST}:{INSPECTOR_PORT}/json", timeout=2
-            ).read()
-            targets = json.loads(data)
+            targets = _get_inspector_targets()
             return len(targets) > 0
         except Exception:
             return False
@@ -75,43 +78,33 @@ def _enable_inspector(pid: int) -> bool:
 
 
 def _get_ws_url() -> str | None:
-    """Get the WebSocket debugger URL from the inspector."""
     try:
-        data = urllib.request.urlopen(
-            f"http://{INSPECTOR_HOST}:{INSPECTOR_PORT}/json", timeout=2
-        ).read()
-        targets = json.loads(data)
+        targets = _get_inspector_targets()
         if targets:
             return targets[0].get("webSocketDebuggerUrl")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Inspector not available: {e}")
     return None
 
 
 class PlaudClient:
-    """
-    Plaud API client using Chrome DevTools Protocol.
+    """Plaud API client using Chrome DevTools Protocol.
 
     Connects to the running Plaud Desktop app via its Node.js inspector
     and executes API calls through the app's authenticated $fetch function.
-
-    No token extraction needed - uses the app's live session directly.
+    No token extraction needed — uses the app's live session directly.
     """
 
     def __init__(self) -> None:
         self._ws_url: str | None = None
         self._msg_id = 0
-        self._connected = False
 
     def _ensure_inspector(self) -> None:
-        """Ensure the Plaud Desktop inspector is available."""
-        # Check if inspector is already running
         ws_url = _get_ws_url()
         if ws_url:
             self._ws_url = ws_url
             return
 
-        # Find Plaud process and enable inspector
         pid = _find_plaud_pid()
         if not pid:
             raise PlaudAPIError(
@@ -133,7 +126,7 @@ class PlaudClient:
             )
         self._ws_url = ws_url
 
-    async def _cdp_eval(self, js_expression: str) -> Any:
+    async def _cdp_eval(self, js_expression: str, _retry: bool = True) -> Any:
         """Execute JavaScript in the Plaud Desktop context via CDP."""
         self._ensure_inspector()
         assert self._ws_url is not None
@@ -152,15 +145,17 @@ class PlaudClient:
         try:
             async with websockets.connect(
                 self._ws_url,
-                max_size=2**22,  # 4MB max message
+                max_size=2**22,
                 open_timeout=5,
                 close_timeout=5,
             ) as ws:
                 await ws.send(json.dumps(msg))
                 response = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
         except Exception as e:
-            # Inspector might have become stale, clear cached URL
             self._ws_url = None
+            if _retry:
+                logger.debug(f"CDP connection failed, retrying: {e}")
+                return await self._cdp_eval(js_expression, _retry=False)
             raise PlaudAPIError(503, f"CDP connection failed: {e}")
 
         result = response.get("result", {}).get("result", {})
@@ -178,7 +173,6 @@ class PlaudClient:
         return result.get("value")
 
     def is_available(self) -> bool:
-        """Check if Plaud Desktop is running and inspector can connect."""
         try:
             self._ensure_inspector()
             return True
@@ -207,12 +201,11 @@ class PlaudClient:
         """
         result = await self._cdp_eval(js)
         if isinstance(result, dict) and "error" in result:
-            status = result.get("status", 0)
-            raise PlaudAPIError(status, result["error"])
+            raise PlaudAPIError(result.get("status", 0), result["error"])
         return result
 
     async def _fetch_content_url(self, url: str) -> Any:
-        """Fetch content from a signed URL (e.g., S3), handling gzip."""
+        """Fetch content from a signed S3 URL, handling gzip."""
         async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=30.0)
             response.raise_for_status()
@@ -221,9 +214,13 @@ class PlaudClient:
                 content = gzip.decompress(content)
             return json.loads(content)
 
-    # ========================================================================
-    # File Operations
-    # ========================================================================
+    async def _get_content_by_type(self, file_id: str, data_type: str, label: str) -> Any:
+        """Fetch file content (transcript, summary, etc.) by data_type."""
+        detail = await self.get_file_detail(file_id)
+        for content in detail.get("content_list", []):
+            if content.get("data_type") == data_type:
+                return await self._fetch_content_url(content["data_link"])
+        raise PlaudAPIError(404, f"No {label} available for file {file_id}")
 
     async def get_files(
         self,
@@ -233,7 +230,6 @@ class PlaudClient:
         sort_by: str = "start_time",
         is_desc: bool = True,
     ) -> list[dict[str, Any]]:
-        """Get list of Plaud files."""
         params = {
             "skip": skip,
             "limit": limit,
@@ -245,59 +241,26 @@ class PlaudClient:
         return response.get("data_file_list", [])
 
     async def get_file_count(self) -> int:
-        """Get total number of files."""
         response = await self._fetch(
             "/file/simple/web", params={"skip": 0, "limit": 1}
         )
         return response.get("data_file_total", 0)
 
     async def get_file(self, file_id: str) -> dict[str, Any]:
-        """Get metadata for a specific file."""
-        files = await self.get_files(limit=1000)
-        for f in files:
-            if f.get("id") == file_id:
-                return f
-        raise PlaudAPIError(404, f"File not found: {file_id}")
+        """Get metadata for a specific file via detail endpoint."""
+        return await self.get_file_detail(file_id)
 
     async def get_file_detail(self, file_id: str) -> dict[str, Any]:
-        """Get detailed file info including signed URLs for content."""
         response = await self._fetch(f"/file/detail/{file_id}")
         return response.get("data", {})
 
     async def get_transcript(self, file_id: str) -> Any:
-        """Get transcript for a file."""
-        detail = await self.get_file_detail(file_id)
-        content_list = detail.get("content_list", [])
-
-        transcript_url = None
-        for content in content_list:
-            if content.get("data_type") == "transaction":
-                transcript_url = content.get("data_link")
-                break
-
-        if not transcript_url:
-            return {"error": "No transcript available", "file_id": file_id}
-
-        return await self._fetch_content_url(transcript_url)
+        return await self._get_content_by_type(file_id, "transaction", "transcript")
 
     async def get_summary(self, file_id: str) -> Any:
-        """Get AI summary for a file."""
-        detail = await self.get_file_detail(file_id)
-        content_list = detail.get("content_list", [])
-
-        summary_url = None
-        for content in content_list:
-            if content.get("data_type") == "auto_sum_note":
-                summary_url = content.get("data_link")
-                break
-
-        if not summary_url:
-            return {"error": "No summary available", "file_id": file_id}
-
-        return await self._fetch_content_url(summary_url)
+        return await self._get_content_by_type(file_id, "auto_sum_note", "summary")
 
     async def get_recent_files(self, days: int = 7) -> list[dict[str, Any]]:
-        """Get files from the last N days."""
         cutoff_ms = int((time.time() - days * 24 * 60 * 60) * 1000)
         files = await self.get_files(limit=100)
         return [f for f in files if f.get("start_time", 0) >= cutoff_ms]
