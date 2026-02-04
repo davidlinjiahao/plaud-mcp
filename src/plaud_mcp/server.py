@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-Plaud MCP Server - Light wrapper around Plaud API.
+Plaud MCP Server - CDP proxy through Plaud Desktop.
 
-Uses Plaud Desktop's authentication token to access the consumer API.
-No developer API credentials required - just sign in to Plaud Desktop.
+Connects to the running Plaud Desktop app via Chrome DevTools Protocol
+and executes API calls through the app's own authenticated session.
+No token extraction needed - just have Plaud Desktop running and logged in.
 """
 
 import logging
+import os
 import sys
 from datetime import datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import config
 from .plaud_client import PlaudClient, PlaudAPIError
 
 # Configure logging
 logging.basicConfig(
-    level=getattr(logging, config.log_level.upper()),
+    level=getattr(logging, os.environ.get("PLAUD_LOG_LEVEL", "INFO").upper()),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -251,12 +252,12 @@ async def check_connection() -> dict[str, Any]:
             return {
                 "status": "connected",
                 "total_files": count,
-                "message": "Successfully connected to Plaud via Desktop app",
+                "message": "Connected to Plaud via Desktop app CDP proxy",
             }
         else:
             return {
                 "status": "unavailable",
-                "message": "Plaud Desktop not installed or not signed in",
+                "message": "Plaud Desktop not running or not signed in. Launch the app and try again.",
             }
     except PlaudAPIError as e:
         return {"status": "error", "message": str(e)}
@@ -364,16 +365,15 @@ def main():
             "Please install Plaud Desktop and sign in to use this MCP."
         )
 
-    # Default to stdio transport for Claude Desktop integration
+    # Default to stdio transport for Claude Code integration
     transport = "stdio"
-    port = 8000
 
     # Check for HTTP mode (for development/testing)
     if "--http" in sys.argv:
         transport = "streamable-http"
         logger.info("Running in HTTP mode")
     else:
-        logger.info("Running in stdio mode (Claude Desktop compatible)")
+        logger.info("Running in stdio mode (Claude Code compatible)")
 
     try:
         mcp.run(transport=transport)

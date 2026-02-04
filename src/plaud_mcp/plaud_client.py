@@ -1,17 +1,32 @@
-"""Plaud API client using Plaud Desktop authentication."""
+"""Plaud API client via Chrome DevTools Protocol (CDP).
 
-import base64
+Connects to the running Plaud Desktop app's Node.js inspector and executes
+API calls through the app's own authenticated $fetch function. This bypasses
+all token/session issues since we piggyback on the app's live session.
+
+Requirements:
+- Plaud Desktop must be running and logged in
+- SIGUSR1 is sent to enable the Node.js inspector on port 9229
+"""
+
+import asyncio
+import gzip
 import json
 import logging
-import re
+import os
+import signal
 import subprocess
 import time
-from pathlib import Path
+import urllib.request
 from typing import Any
 
 import httpx
+import websockets
 
 logger = logging.getLogger(__name__)
+
+INSPECTOR_PORT = 9229
+INSPECTOR_HOST = "127.0.0.1"
 
 
 class PlaudAPIError(Exception):
@@ -23,195 +38,188 @@ class PlaudAPIError(Exception):
         super().__init__(f"Plaud API Error ({status_code}): {message}")
 
 
+def _find_plaud_pid() -> int | None:
+    """Find the main Plaud Desktop process PID."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "Plaud.app/Contents/MacOS/Plaud"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            pids = result.stdout.strip().split("\n")
+            if pids and pids[0]:
+                return int(pids[0])
+    except Exception as e:
+        logger.debug(f"Failed to find Plaud PID: {e}")
+    return None
+
+
+def _enable_inspector(pid: int) -> bool:
+    """Send SIGUSR1 to enable Node.js inspector on the Plaud process."""
+    try:
+        os.kill(pid, signal.SIGUSR1)
+        time.sleep(0.5)
+        # Verify inspector is listening
+        try:
+            data = urllib.request.urlopen(
+                f"http://{INSPECTOR_HOST}:{INSPECTOR_PORT}/json", timeout=2
+            ).read()
+            targets = json.loads(data)
+            return len(targets) > 0
+        except Exception:
+            return False
+    except Exception as e:
+        logger.debug(f"Failed to enable inspector: {e}")
+        return False
+
+
+def _get_ws_url() -> str | None:
+    """Get the WebSocket debugger URL from the inspector."""
+    try:
+        data = urllib.request.urlopen(
+            f"http://{INSPECTOR_HOST}:{INSPECTOR_PORT}/json", timeout=2
+        ).read()
+        targets = json.loads(data)
+        if targets:
+            return targets[0].get("webSocketDebuggerUrl")
+    except Exception:
+        pass
+    return None
+
+
 class PlaudClient:
     """
-    Plaud API client using Plaud Desktop's authentication token.
+    Plaud API client using Chrome DevTools Protocol.
 
-    This client extracts the JWT token from Plaud Desktop's local storage
-    and uses it to access the Plaud consumer API at api.plaud.ai.
+    Connects to the running Plaud Desktop app via its Node.js inspector
+    and executes API calls through the app's authenticated $fetch function.
 
-    No developer API credentials required - uses the same auth as the desktop app.
+    No token extraction needed - uses the app's live session directly.
     """
 
-    API_BASE = "https://api.plaud.ai"
-    TOKEN_PATH = Path.home() / "Library/Application Support/Plaud/Local Storage/leveldb"
+    def __init__(self) -> None:
+        self._ws_url: str | None = None
+        self._msg_id = 0
+        self._connected = False
 
-    def __init__(self):
-        self._access_token: str | None = None
-        self._token_data: dict | None = None
+    def _ensure_inspector(self) -> None:
+        """Ensure the Plaud Desktop inspector is available."""
+        # Check if inspector is already running
+        ws_url = _get_ws_url()
+        if ws_url:
+            self._ws_url = ws_url
+            return
 
-    def _extract_token_from_leveldb(self) -> str | None:
-        """
-        Extract JWT token from Plaud Desktop's LevelDB storage.
+        # Find Plaud process and enable inspector
+        pid = _find_plaud_pid()
+        if not pid:
+            raise PlaudAPIError(
+                503,
+                "Plaud Desktop is not running. Please launch the Plaud Desktop app.",
+            )
 
-        The token is stored in Local Storage but LevelDB may insert binary bytes
-        between the base64 segments. We extract the key values and reconstruct
-        the token.
-        """
-        if not self.TOKEN_PATH.exists():
-            logger.warning(f"Plaud Desktop storage not found at {self.TOKEN_PATH}")
-            return None
+        if not _enable_inspector(pid):
+            raise PlaudAPIError(
+                503,
+                "Could not enable Plaud Desktop inspector. "
+                "Please ensure Plaud Desktop is running and try again.",
+            )
+
+        ws_url = _get_ws_url()
+        if not ws_url:
+            raise PlaudAPIError(
+                503, "Inspector enabled but could not get WebSocket URL."
+            )
+        self._ws_url = ws_url
+
+    async def _cdp_eval(self, js_expression: str) -> Any:
+        """Execute JavaScript in the Plaud Desktop context via CDP."""
+        self._ensure_inspector()
+        assert self._ws_url is not None
+
+        self._msg_id += 1
+        msg = {
+            "id": self._msg_id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": js_expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        }
 
         try:
-            # Read all LDB files and search for the bearer token
-            for f in self.TOKEN_PATH.glob("*.ldb"):
-                data = f.read_bytes()
-
-                # Find bearer token location
-                idx = data.find(b"bearer eyJ")
-                if idx >= 0:
-                    chunk = data[idx + 7 : idx + 600]  # Skip 'bearer '
-
-                    # Extract header (up to first .)
-                    header_end = chunk.find(b".")
-                    if header_end < 0:
-                        continue
-                    header = chunk[:header_end].decode("ascii", errors="ignore")
-
-                    # Extract all base64-like segments
-                    segments = []
-                    current = b""
-                    base64_chars = set(
-                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-                    )
-
-                    for byte in chunk[header_end + 1 :]:
-                        if byte in base64_chars:
-                            current += bytes([byte])
-                        else:
-                            if len(current) > 5:
-                                segments.append(current.decode("ascii"))
-                            current = b""
-
-                    if len(current) > 5:
-                        segments.append(current.decode("ascii"))
-
-                    # Filter to payload segments (> 20 chars, not data)
-                    payload_parts = [
-                        s for s in segments
-                        if len(s) > 20 and not s.startswith("logged")
-                    ]
-
-                    if len(payload_parts) >= 4:
-                        try:
-                            # Decode first segment to get user ID
-                            seg0_padded = payload_parts[0] + "=" * ((4 - len(payload_parts[0]) % 4) % 4)
-                            seg0_decoded = base64.urlsafe_b64decode(seg0_padded).decode("utf-8", errors="ignore")
-
-                            # Extract sub (user ID) from decoded segment
-                            sub_match = re.search(r'"sub":"([a-f0-9]+)"', seg0_decoded)
-                            if not sub_match:
-                                continue
-                            sub = sub_match.group(1)
-
-                            # Decode second segment to get exp and iat
-                            seg1_padded = payload_parts[1] + "=" * ((4 - len(payload_parts[1]) % 4) % 4)
-                            seg1_decoded = base64.urlsafe_b64decode(seg1_padded).decode("utf-8", errors="ignore")
-
-                            # Extract exp and iat values
-                            exp_match = re.search(r'(\d{10})', seg1_decoded)
-                            iat_match = re.search(r'"iat":(\d+)', seg1_decoded)
-
-                            if not exp_match:
-                                continue
-                            exp = int(exp_match.group(1))
-                            iat = int(iat_match.group(1)) if iat_match else exp - 25920000  # ~300 days
-
-                            # Signature is usually segment 3 (after the garbage segment 2)
-                            signature = payload_parts[3] if len(payload_parts) > 3 else payload_parts[-1]
-
-                            # Reconstruct the payload with known structure
-                            payload_data = {
-                                "sub": sub,
-                                "aud": "",
-                                "exp": exp,
-                                "iat": iat,
-                                "client_id": "desktop",
-                                "region": "aws:us-west-2"
-                            }
-
-                            payload_json = json.dumps(payload_data, separators=(",", ":"))
-                            payload_b64 = (
-                                base64.urlsafe_b64encode(payload_json.encode())
-                                .decode()
-                                .rstrip("=")
-                            )
-
-                            full_token = f"{header}.{payload_b64}.{signature}"
-                            self._token_data = payload_data
-
-                            logger.debug(
-                                f"Extracted Plaud token for user: {sub}"
-                            )
-                            return full_token
-
-                        except Exception as e:
-                            logger.debug(f"Failed to decode token from {f.name}: {e}")
-                            continue
-
-            return None
-
+            async with websockets.connect(
+                self._ws_url,
+                max_size=2**22,  # 4MB max message
+                open_timeout=5,
+                close_timeout=5,
+            ) as ws:
+                await ws.send(json.dumps(msg))
+                response = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
         except Exception as e:
-            logger.error(f"Failed to extract Plaud token: {e}")
+            # Inspector might have become stale, clear cached URL
+            self._ws_url = None
+            raise PlaudAPIError(503, f"CDP connection failed: {e}")
+
+        result = response.get("result", {}).get("result", {})
+
+        if result.get("subtype") == "error":
+            desc = result.get("description", "Unknown JS error")
+            raise PlaudAPIError(500, f"JavaScript error: {desc}")
+
+        if result.get("type") == "string":
+            return json.loads(result["value"])
+
+        if result.get("type") == "undefined":
             return None
 
-    def _ensure_authenticated(self) -> None:
-        """Ensure we have a valid token."""
-        if self._access_token:
-            # Check if token is expired
-            if self._token_data and "exp" in self._token_data:
-                if time.time() < self._token_data["exp"]:
-                    return
-                logger.debug("Token expired, re-extracting")
-
-        token = self._extract_token_from_leveldb()
-        if not token:
-            raise PlaudAPIError(
-                401,
-                "No Plaud Desktop token found. Please sign in to Plaud Desktop app.",
-            )
-        self._access_token = token
+        return result.get("value")
 
     def is_available(self) -> bool:
-        """Check if Plaud Desktop is installed and has valid auth."""
+        """Check if Plaud Desktop is running and inspector can connect."""
         try:
-            self._ensure_authenticated()
+            self._ensure_inspector()
             return True
         except PlaudAPIError:
             return False
 
-    async def _request(
-        self,
-        method: str,
-        endpoint: str,
-        params: dict[str, Any] | None = None,
+    async def _fetch(
+        self, endpoint: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Make an authenticated request to Plaud API."""
-        self._ensure_authenticated()
+        """Make an API call through the Plaud Desktop's authenticated $fetch."""
+        params_js = json.dumps(params) if params else "undefined"
+        js = f"""
+            (async () => {{
+                try {{
+                    const fetchFn = globalThis['$fetch'];
+                    if (!fetchFn) {{
+                        return JSON.stringify({{ error: '$fetch not available - user may not be logged in' }});
+                    }}
+                    const opts = {params_js} !== undefined ? {{ params: {params_js} }} : {{}};
+                    const result = await fetchFn('{endpoint}', opts);
+                    return JSON.stringify(result);
+                }} catch(e) {{
+                    return JSON.stringify({{ error: e.message, status: e.status || 0 }});
+                }}
+            }})()
+        """
+        result = await self._cdp_eval(js)
+        if isinstance(result, dict) and "error" in result:
+            status = result.get("status", 0)
+            raise PlaudAPIError(status, result["error"])
+        return result
 
-        url = f"{self.API_BASE}/{endpoint.lstrip('/')}"
-
+    async def _fetch_content_url(self, url: str) -> Any:
+        """Fetch content from a signed URL (e.g., S3), handling gzip."""
         async with httpx.AsyncClient() as client:
-            try:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers={
-                        "Authorization": f"bearer {self._access_token}",
-                        "Content-Type": "application/json",
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                    },
-                    params=params,
-                    timeout=30.0,
-                )
-                response.raise_for_status()
-                return response.json()
-
-            except httpx.HTTPStatusError as e:
-                error_msg = e.response.text if e.response.content else str(e)
-                raise PlaudAPIError(e.response.status_code, error_msg)
-            except httpx.RequestError as e:
-                raise PlaudAPIError(0, f"Request failed: {str(e)}")
+            response = await client.get(url, timeout=30.0)
+            response.raise_for_status()
+            content = response.content
+            if content[:2] == b"\x1f\x8b":
+                content = gzip.decompress(content)
+            return json.loads(content)
 
     # ========================================================================
     # File Operations
@@ -221,23 +229,11 @@ class PlaudClient:
         self,
         skip: int = 0,
         limit: int = 100,
-        is_trash: int = 2,  # 0=trashed, 1=untrashed, 2=all
+        is_trash: int = 2,
         sort_by: str = "start_time",
         is_desc: bool = True,
     ) -> list[dict[str, Any]]:
-        """
-        Get list of Plaud files.
-
-        Args:
-            skip: Number of files to skip (pagination)
-            limit: Maximum number of results
-            is_trash: Trash filter (0=trashed, 1=untrashed, 2=all)
-            sort_by: Sort field
-            is_desc: Sort descending
-
-        Returns:
-            List of file objects
-        """
+        """Get list of Plaud files."""
         params = {
             "skip": skip,
             "limit": limit,
@@ -245,29 +241,18 @@ class PlaudClient:
             "sort_by": sort_by,
             "is_desc": str(is_desc).lower(),
         }
-
-        response = await self._request("GET", "file/simple/web", params=params)
+        response = await self._fetch("/file/simple/web", params=params)
         return response.get("data_file_list", [])
 
     async def get_file_count(self) -> int:
         """Get total number of files."""
-        response = await self._request(
-            "GET", "file/simple/web", params={"skip": 0, "limit": 1}
+        response = await self._fetch(
+            "/file/simple/web", params={"skip": 0, "limit": 1}
         )
         return response.get("data_file_total", 0)
 
     async def get_file(self, file_id: str) -> dict[str, Any]:
-        """
-        Get metadata for a specific file.
-
-        Args:
-            file_id: File ID
-
-        Returns:
-            File metadata object
-        """
-        # Get all files and find the one we want
-        # (Consumer API doesn't have single-file endpoint)
+        """Get metadata for a specific file."""
         files = await self.get_files(limit=1000)
         for f in files:
             if f.get("id") == file_id:
@@ -275,48 +260,15 @@ class PlaudClient:
         raise PlaudAPIError(404, f"File not found: {file_id}")
 
     async def get_file_detail(self, file_id: str) -> dict[str, Any]:
-        """
-        Get detailed file info including signed URLs for content.
-
-        Args:
-            file_id: File ID
-
-        Returns:
-            File detail object with content_list containing signed URLs
-        """
-        response = await self._request("GET", f"file/detail/{file_id}")
+        """Get detailed file info including signed URLs for content."""
+        response = await self._fetch(f"/file/detail/{file_id}")
         return response.get("data", {})
 
-    async def _fetch_content(self, url: str) -> dict[str, Any]:
-        """Fetch content from signed URL, handling gzip if needed."""
-        import gzip
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=30.0)
-            response.raise_for_status()
-
-            content = response.content
-            # Check if gzipped (starts with gzip magic bytes)
-            if content[:2] == b"\x1f\x8b":
-                content = gzip.decompress(content)
-
-            return json.loads(content)
-
-    async def get_transcript(self, file_id: str) -> dict[str, Any]:
-        """
-        Get transcript for a file.
-
-        Args:
-            file_id: File ID
-
-        Returns:
-            Transcript data with segments
-        """
-        # Get file details to get signed URL
+    async def get_transcript(self, file_id: str) -> Any:
+        """Get transcript for a file."""
         detail = await self.get_file_detail(file_id)
         content_list = detail.get("content_list", [])
 
-        # Find transcript URL
         transcript_url = None
         for content in content_list:
             if content.get("data_type") == "transaction":
@@ -326,23 +278,13 @@ class PlaudClient:
         if not transcript_url:
             return {"error": "No transcript available", "file_id": file_id}
 
-        return await self._fetch_content(transcript_url)
+        return await self._fetch_content_url(transcript_url)
 
-    async def get_summary(self, file_id: str) -> dict[str, Any]:
-        """
-        Get AI summary for a file.
-
-        Args:
-            file_id: File ID
-
-        Returns:
-            Summary data
-        """
-        # Get file details to get signed URL
+    async def get_summary(self, file_id: str) -> Any:
+        """Get AI summary for a file."""
         detail = await self.get_file_detail(file_id)
         content_list = detail.get("content_list", [])
 
-        # Find summary URL (auto_sum_note type)
         summary_url = None
         for content in content_list:
             if content.get("data_type") == "auto_sum_note":
@@ -352,18 +294,10 @@ class PlaudClient:
         if not summary_url:
             return {"error": "No summary available", "file_id": file_id}
 
-        return await self._fetch_content(summary_url)
+        return await self._fetch_content_url(summary_url)
 
     async def get_recent_files(self, days: int = 7) -> list[dict[str, Any]]:
-        """
-        Get files from the last N days.
-
-        Args:
-            days: Number of days to look back
-
-        Returns:
-            List of recent files
-        """
+        """Get files from the last N days."""
         cutoff_ms = int((time.time() - days * 24 * 60 * 60) * 1000)
         files = await self.get_files(limit=100)
         return [f for f in files if f.get("start_time", 0) >= cutoff_ms]
