@@ -65,6 +65,9 @@ def detect_device(file: dict) -> str:
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "phi4"
 
+HF_INFERENCE_URL = "https://router.huggingface.co/hf-inference/models/microsoft/Phi-3.5-mini-instruct/v1/chat/completions"
+HF_MODEL = "microsoft/Phi-3.5-mini-instruct"
+
 # Speaker names that map to the user (Elliot)
 ELLIOT_SPEAKERS = {"Elliot A. Jarbe", "Ej", "Elliot"}
 
@@ -226,10 +229,101 @@ async def extract_tasks_via_ollama(elliot_text: str) -> list[dict]:
     return []
 
 
-async def extract_tasks(elliot_text: str, use_ollama: bool) -> list[dict]:
-    """Extract tasks — Ollama if available, otherwise heuristic."""
+def _get_hf_token() -> str | None:
+    """Read HF token from environment or cache."""
+    import os
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        return token
+    # Check common file locations
+    for p in ["~/.cache/huggingface/token", "~/.huggingface/token"]:
+        fp = Path(p).expanduser()
+        if fp.exists():
+            return fp.read_text().strip()
+    return None
+
+
+async def _hf_inference_available() -> bool:
+    """Check if HF Inference API is reachable with valid permissions."""
+    token = _get_hf_token()
+    if not token:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                HF_INFERENCE_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "model": HF_MODEL,
+                    "messages": [{"role": "user", "content": "Say OK"}],
+                    "max_tokens": 5,
+                },
+                timeout=10.0,
+            )
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def extract_tasks_via_hf(elliot_text: str) -> list[dict]:
+    """Use HuggingFace Inference API to extract tasks."""
+    if not elliot_text or len(elliot_text) < 30:
+        return []
+
+    token = _get_hf_token()
+    if not token:
+        return []
+
+    text = elliot_text[:3000]
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                HF_INFERENCE_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "model": HF_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Extract work tasks from this employee's meeting update. "
+                                "Output ONLY a JSON array of objects with "
+                                '"description" (one professional sentence for a timesheet) '
+                                'and "hours" (float: 0.5 quick, 1.0 meeting, 2.0 project work, '
+                                "4.0 half-day). No markdown, no explanation, just the JSON array."
+                            ),
+                        },
+                        {"role": "user", "content": f"MEETING UPDATE:\n{text}"},
+                    ],
+                    "max_tokens": 512,
+                    "temperature": 0.1,
+                },
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                return []
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if match:
+                tasks = json.loads(match.group())
+                return [
+                    {"description": t.get("description", ""), "hours": float(t.get("hours", 0))}
+                    for t in tasks
+                    if t.get("description")
+                ]
+    except Exception as e:
+        print(f"    HF inference failed: {e}")
+    return []
+
+
+async def extract_tasks(elliot_text: str, use_ollama: bool, use_hf: bool) -> list[dict]:
+    """Extract tasks — Ollama first, then HF Inference, then heuristic."""
     if use_ollama:
         tasks = await extract_tasks_via_ollama(elliot_text)
+        if tasks:
+            return tasks
+    if use_hf:
+        tasks = await extract_tasks_via_hf(elliot_text)
         if tasks:
             return tasks
     return extract_tasks_heuristic(elliot_text)
@@ -442,7 +536,7 @@ async def process_file(client: PlaudClient, file: dict, results: list[dict]) -> 
     if file_type == "work" and segments:
         elliot_text = extract_elliot_segments(segments)
         if elliot_text:
-            tasks = await extract_tasks(elliot_text, use_ollama=_USE_OLLAMA)
+            tasks = await extract_tasks(elliot_text, use_ollama=_USE_OLLAMA, use_hf=_USE_HF)
             if tasks:
                 print(f"    Extracted {len(tasks)} tasks ({sum(t['hours'] for t in tasks):.1f}h)")
 
@@ -517,10 +611,11 @@ def write_index(results: list[dict]) -> None:
 
 
 _USE_OLLAMA = False  # Set in main() after detection
+_USE_HF = False
 
 
 async def main() -> None:
-    global _USE_OLLAMA
+    global _USE_OLLAMA, _USE_HF
 
     print(f"Fetching Plaud files from the last {DAYS} days...")
     client = PlaudClient()
@@ -529,12 +624,16 @@ async def main() -> None:
         print("ERROR: Plaud Desktop not available. Is it installed and signed in?")
         sys.exit(1)
 
-    # Detect Ollama for task extraction
+    # Detect LLM providers for task extraction (priority: Ollama > HF > heuristic)
     _USE_OLLAMA = await _ollama_available()
     if _USE_OLLAMA:
         print(f"Ollama detected — using {OLLAMA_MODEL} for task extraction")
     else:
-        print("Ollama not available — using heuristic task extraction")
+        _USE_HF = await _hf_inference_available()
+        if _USE_HF:
+            print(f"HuggingFace Inference detected — using {HF_MODEL} for task extraction")
+        else:
+            print("No LLM available — using heuristic task extraction")
 
     files = await client.get_recent_files(days=DAYS)
     print(f"Found {len(files)} files\n")
