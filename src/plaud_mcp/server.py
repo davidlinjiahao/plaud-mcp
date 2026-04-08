@@ -139,7 +139,7 @@ async def check_connection() -> dict[str, Any]:
             return {
                 "status": "connected",
                 "total_files": count,
-                "message": "Connected to Plaud via Desktop app CDP proxy",
+                "message": "Connected to Plaud API via decrypted auth token",
             }
         return {
             "status": "unavailable",

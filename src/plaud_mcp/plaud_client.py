@@ -1,35 +1,32 @@
-"""Plaud API client via Chrome DevTools Protocol (CDP).
+"""Plaud API client via direct HTTP with token decryption.
 
-Connects to the running Plaud Desktop app's Node.js inspector and executes
-API calls through the app's own authenticated $fetch function. This bypasses
-all token/session issues since we piggyback on the app's live session.
-
-Security note: SIGUSR1 opens the Node.js inspector on localhost:9229 for the
-lifetime of the Plaud Desktop process. Only local processes can connect.
+Reads the auth token from Plaud Desktop's encryption.json, decrypts it
+using the macOS Keychain "Plaud Safe Storage" key (Chromium v10 format),
+and makes direct API calls to api.plaud.ai.
 
 Requirements:
-- Plaud Desktop must be running and logged in
-- SIGUSR1 is sent to enable the Node.js inspector on port 9229
+- Plaud Desktop must be installed and signed in (at least once)
+- macOS Keychain access to "Plaud Safe Storage"
+- cryptography package
 """
 
-import asyncio
+import base64
 import gzip
+import hashlib
 import json
 import logging
-import os
-import signal
 import subprocess
 import time
-import urllib.request
+from pathlib import Path
 from typing import Any
 
 import httpx
-import websockets
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 logger = logging.getLogger(__name__)
 
-INSPECTOR_PORT = 9229
-INSPECTOR_HOST = "127.0.0.1"
+PLAUD_DATA_DIR = Path.home() / "Library" / "Application Support" / "Plaud"
+API_BASE = "https://api.plaud.ai"
 
 
 class PlaudAPIError(Exception):
@@ -39,142 +36,72 @@ class PlaudAPIError(Exception):
         super().__init__(f"Plaud API Error ({status_code}): {message}")
 
 
-def _get_inspector_targets() -> list[dict[str, Any]]:
-    """Fetch inspector targets from the debugging endpoint."""
-    data = urllib.request.urlopen(
-        f"http://{INSPECTOR_HOST}:{INSPECTOR_PORT}/json", timeout=2
-    ).read()
-    return json.loads(data)
-
-
-def _find_plaud_pid() -> int | None:
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "Plaud.app/Contents/MacOS/Plaud"],
-            capture_output=True,
-            text=True,
+def _get_keychain_password() -> str:
+    """Read the Plaud Safe Storage password from macOS Keychain."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", "Plaud Safe Storage", "-w"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise PlaudAPIError(
+            503, "Cannot read Plaud Safe Storage from Keychain. Is Plaud Desktop installed?"
         )
-        if result.returncode == 0:
-            pids = result.stdout.strip().split("\n")
-            if pids and pids[0]:
-                return int(pids[0])
-    except Exception as e:
-        logger.debug(f"Failed to find Plaud PID: {e}")
-    return None
+    return result.stdout.strip()
 
 
-def _enable_inspector(pid: int) -> bool:
-    try:
-        os.kill(pid, signal.SIGUSR1)
-        time.sleep(0.5)
-        try:
-            targets = _get_inspector_targets()
-            return len(targets) > 0
-        except Exception:
-            return False
-    except Exception as e:
-        logger.debug(f"Failed to enable inspector: {e}")
-        return False
+def _decrypt_v10_token(encrypted_b64: str, keychain_pass: str) -> str:
+    """Decrypt a Chromium v10 Safe Storage encrypted value."""
+    encrypted = base64.b64decode(encrypted_b64)
+    if encrypted[:3] != b"v10":
+        raise PlaudAPIError(500, "Unexpected encryption format (not v10)")
+    encrypted = encrypted[3:]
+    key = hashlib.pbkdf2_hmac("sha1", keychain_pass.encode(), b"saltysalt", 1003, dklen=16)
+    decryptor = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).decryptor()
+    decrypted = decryptor.update(encrypted) + decryptor.finalize()
+    pad_len = decrypted[-1]
+    if 1 <= pad_len <= 16:
+        decrypted = decrypted[:-pad_len]
+    return decrypted.decode("utf-8")
 
 
-def _get_ws_url() -> str | None:
-    try:
-        targets = _get_inspector_targets()
-        if targets:
-            return targets[0].get("webSocketDebuggerUrl")
-    except Exception as e:
-        logger.debug(f"Inspector not available: {e}")
-    return None
+def _load_auth_token() -> str:
+    """Load and decrypt the auth token from Plaud Desktop's local storage."""
+    enc_path = PLAUD_DATA_DIR / "encryption.json"
+    if not enc_path.exists():
+        raise PlaudAPIError(503, "Plaud Desktop data not found. Is it installed and signed in?")
+    data = json.loads(enc_path.read_text())
+    encrypted_token = data.get("authToken")
+    if not encrypted_token:
+        raise PlaudAPIError(503, "No auth token in encryption.json. Sign into Plaud Desktop first.")
+    keychain_pass = _get_keychain_password()
+    decrypted = _decrypt_v10_token(encrypted_token, keychain_pass)
+    # The decrypted value is "bearer <jwt>" — extract just the token
+    if decrypted.lower().startswith("bearer "):
+        return decrypted[7:]
+    return decrypted
 
 
 class PlaudClient:
-    """Plaud API client using Chrome DevTools Protocol.
-
-    Connects to the running Plaud Desktop app via its Node.js inspector
-    and executes API calls through the app's authenticated $fetch function.
-    No token extraction needed — uses the app's live session directly.
-    """
+    """Plaud API client using direct HTTP with decrypted auth token."""
 
     def __init__(self) -> None:
-        self._ws_url: str | None = None
-        self._msg_id = 0
+        self._token: str | None = None
 
-    def _ensure_inspector(self) -> None:
-        ws_url = _get_ws_url()
-        if ws_url:
-            self._ws_url = ws_url
-            return
+    def _get_token(self) -> str:
+        if self._token is None:
+            self._token = _load_auth_token()
+        return self._token
 
-        pid = _find_plaud_pid()
-        if not pid:
-            raise PlaudAPIError(
-                503,
-                "Plaud Desktop is not running. Please launch the Plaud Desktop app.",
-            )
-
-        if not _enable_inspector(pid):
-            raise PlaudAPIError(
-                503,
-                "Could not enable Plaud Desktop inspector. "
-                "Please ensure Plaud Desktop is running and try again.",
-            )
-
-        ws_url = _get_ws_url()
-        if not ws_url:
-            raise PlaudAPIError(
-                503, "Inspector enabled but could not get WebSocket URL."
-            )
-        self._ws_url = ws_url
-
-    async def _cdp_eval(self, js_expression: str, _retry: bool = True) -> Any:
-        """Execute JavaScript in the Plaud Desktop context via CDP."""
-        self._ensure_inspector()
-        assert self._ws_url is not None
-
-        self._msg_id += 1
-        msg = {
-            "id": self._msg_id,
-            "method": "Runtime.evaluate",
-            "params": {
-                "expression": js_expression,
-                "awaitPromise": True,
-                "returnByValue": True,
-            },
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._get_token()}",
+            "Content-Type": "application/json",
         }
-
-        try:
-            async with websockets.connect(
-                self._ws_url,
-                max_size=2**22,
-                open_timeout=5,
-                close_timeout=5,
-            ) as ws:
-                await ws.send(json.dumps(msg))
-                response = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
-        except Exception as e:
-            self._ws_url = None
-            if _retry:
-                logger.debug(f"CDP connection failed, retrying: {e}")
-                return await self._cdp_eval(js_expression, _retry=False)
-            raise PlaudAPIError(503, f"CDP connection failed: {e}")
-
-        result = response.get("result", {}).get("result", {})
-
-        if result.get("subtype") == "error":
-            desc = result.get("description", "Unknown JS error")
-            raise PlaudAPIError(500, f"JavaScript error: {desc}")
-
-        if result.get("type") == "string":
-            return json.loads(result["value"])
-
-        if result.get("type") == "undefined":
-            return None
-
-        return result.get("value")
 
     def is_available(self) -> bool:
         try:
-            self._ensure_inspector()
+            self._get_token()
             return True
         except PlaudAPIError:
             return False
@@ -182,27 +109,22 @@ class PlaudClient:
     async def _fetch(
         self, endpoint: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Make an API call through the Plaud Desktop's authenticated $fetch."""
-        params_js = json.dumps(params) if params else "undefined"
-        js = f"""
-            (async () => {{
-                try {{
-                    const fetchFn = globalThis['$fetch'];
-                    if (!fetchFn) {{
-                        return JSON.stringify({{ error: '$fetch not available - user may not be logged in' }});
-                    }}
-                    const opts = {params_js} !== undefined ? {{ params: {params_js} }} : {{}};
-                    const result = await fetchFn('{endpoint}', opts);
-                    return JSON.stringify(result);
-                }} catch(e) {{
-                    return JSON.stringify({{ error: e.message, status: e.status || 0 }});
-                }}
-            }})()
-        """
-        result = await self._cdp_eval(js)
-        if isinstance(result, dict) and "error" in result:
-            raise PlaudAPIError(result.get("status", 0), result["error"])
-        return result
+        """Make an authenticated API call to Plaud."""
+        url = f"{API_BASE}{endpoint}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url, params=params, headers=self._headers(), timeout=15.0
+            )
+        if response.status_code == 401:
+            # Token may have expired — clear cache and retry once
+            self._token = None
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    url, params=params, headers=self._headers(), timeout=15.0
+                )
+        if response.status_code != 200:
+            raise PlaudAPIError(response.status_code, response.text[:300])
+        return response.json()
 
     async def _fetch_content_url(self, url: str) -> Any:
         """Fetch content from a signed S3 URL, handling gzip."""
@@ -247,7 +169,6 @@ class PlaudClient:
         return response.get("data_file_total", 0)
 
     async def get_file(self, file_id: str) -> dict[str, Any]:
-        """Get metadata for a specific file via detail endpoint."""
         return await self.get_file_detail(file_id)
 
     async def get_file_detail(self, file_id: str) -> dict[str, Any]:
