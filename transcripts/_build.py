@@ -103,9 +103,9 @@ def extract_elliot_segments(segments: list[dict]) -> str:
     """Pull out segments where Elliot is speaking."""
     parts = []
     for seg in segments:
-        speaker = seg.get("speaker", "").strip()
+        speaker = (seg.get("speaker") or "").strip()
         if speaker in ELLIOT_SPEAKERS:
-            content = seg.get("content", "").strip()
+            content = (seg.get("content") or "").strip()
             if content:
                 parts.append(content)
     return " ".join(parts)
@@ -394,7 +394,7 @@ def extract_speakers(segments: list[dict]) -> list[str]:
     speakers = []
     seen = set()
     for seg in segments:
-        speaker = seg.get("speaker", "").strip()
+        speaker = (seg.get("speaker") or "").strip()
         if speaker and speaker not in seen:
             seen.add(speaker)
             speakers.append(speaker)
@@ -405,8 +405,8 @@ def build_transcript_text(segments: list[dict]) -> str:
     """Build readable transcript from segments."""
     lines = []
     for seg in segments:
-        speaker = seg.get("speaker", "").strip()
-        content = seg.get("content", "").strip()
+        speaker = (seg.get("speaker") or "").strip()
+        content = (seg.get("content") or "").strip()
         if not content:
             continue
         if speaker:
